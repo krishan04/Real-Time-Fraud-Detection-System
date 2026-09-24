@@ -1,0 +1,145 @@
+name: realtime-fraud-detection
+
+services:
+  # ---------------------------------------------------------------------------
+  # Apache Kafka 4.x — single-node KRaft (no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: fraud-kafka
+    mem_limit: 512m
+    environment:
+      CLUSTER_ID: ${CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAP_OPTS: "-Xmx384m -Xms256m"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  # One-shot: create the topics with explicit partition counts, then exit.
+  kafka-init:
+    image: apache/kafka:4.0.0
+    container_name: fraud-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${TOPIC_TRANSACTIONS:-transactions} --partitions 3 --replication-factor 1 && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${TOPIC_ALERTS:-fraud_alerts} --partitions 1 --replication-factor 1 && echo topics-ready && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list"]
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Spark Structured Streaming — ingestion + (later) analytics & fraud engine
+  # ---------------------------------------------------------------------------
+  spark:
+    build: ./spark
+    image: fraud-spark
+    container_name: fraud-spark
+    profiles: ["app"]
+    mem_limit: 1600m
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_TRANSACTIONS: ${TOPIC_TRANSACTIONS:-transactions}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      SPARK_CHECKPOINT_DIR: /opt/checkpoints
+      SPARK_MASTER: ${SPARK_MASTER:-local[2]}
+      TOPIC_ALERTS: ${TOPIC_ALERTS:-fraud_alerts}
+      FRAUD_AMOUNT_THRESHOLD: ${FRAUD_AMOUNT_THRESHOLD:-50000}
+      FRAUD_WINDOW_MINUTES: ${FRAUD_WINDOW_MINUTES:-5}
+      FRAUD_MIN_TRANSACTIONS: ${FRAUD_MIN_TRANSACTIONS:-3}
+      FRAUD_MIN_LOCATIONS: ${FRAUD_MIN_LOCATIONS:-2}
+      FRAUD_BASELINE_LOOKBACK_HOURS: ${FRAUD_BASELINE_LOOKBACK_HOURS:-24}
+      FRAUD_BASELINE_MULTIPLIER: ${FRAUD_BASELINE_MULTIPLIER:-3.0}
+      FRAUD_WEIGHT_R1: ${FRAUD_WEIGHT_R1:-0.35}
+      FRAUD_WEIGHT_R2: ${FRAUD_WEIGHT_R2:-0.25}
+      FRAUD_WEIGHT_R3: ${FRAUD_WEIGHT_R3:-0.20}
+      FRAUD_WEIGHT_R4: ${FRAUD_WEIGHT_R4:-0.20}
+      FRAUD_HIGH_CUTOFF: ${FRAUD_HIGH_CUTOFF:-0.70}
+      FRAUD_MEDIUM_CUTOFF: ${FRAUD_MEDIUM_CUTOFF:-0.35}
+    volumes:
+      - spark-checkpoint:/opt/checkpoints
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Python producer — generates fake, deterministic transaction traffic
+  # ---------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    image: fraud-producer
+    container_name: fraud-producer
+    profiles: ["app"]
+    mem_limit: 384m
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_TRANSACTIONS: ${TOPIC_TRANSACTIONS:-transactions}
+      PRODUCER_RATE: ${PRODUCER_RATE:-20}
+      PRODUCER_MAX_EVENTS: ${PRODUCER_MAX_EVENTS:-20000}
+      PRODUCER_NORMAL_USERS: ${PRODUCER_NORMAL_USERS:-14000}
+      FRAUD_BURST_EVERY: ${FRAUD_BURST_EVERY:-1500}
+      PRODUCER_SEED: ${PRODUCER_SEED:-42}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 — persistent queryable state
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: fraud-postgres
+    mem_limit: 384m
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fraud} -d ${POSTGRES_DB:-frauddb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  kafka-data:
+  pgdata:
+  spark-checkpoint:
