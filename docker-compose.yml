@@ -117,6 +117,65 @@ services:
         condition: service_completed_successfully
 
   # ---------------------------------------------------------------------------
+  # FastAPI serving layer (M6, profile `full`)
+  # ---------------------------------------------------------------------------
+  backend:
+    build: ./backend
+    image: fraud-backend
+    container_name: fraud-backend
+    profiles: ["full"]
+    mem_limit: 256m
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_ALERTS: ${TOPIC_ALERTS:-fraud_alerts}
+      BACKEND_CONSUMER_GROUP: ${BACKEND_CONSUMER_GROUP:-fraud-dashboard-consumer}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      SSE_QUEUE_SIZE: ${SSE_QUEUE_SIZE:-1000}
+      SSE_KEEPALIVE_S: ${SSE_KEEPALIVE_S:-15}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Streamlit dashboard (M7, profile `full`) — HTTP-only client of FastAPI
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build: ./dashboard
+    image: fraud-dashboard
+    container_name: fraud-dashboard
+    profiles: ["full"]
+    mem_limit: 256m
+    restart: unless-stopped
+    environment:
+      DASHBOARD_BACKEND_URL: ${DASHBOARD_BACKEND_URL:-http://backend:8000}
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
   # PostgreSQL 16 — persistent queryable state
   # ---------------------------------------------------------------------------
   postgres:

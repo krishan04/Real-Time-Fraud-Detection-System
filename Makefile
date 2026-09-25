@@ -4,6 +4,7 @@
 COMPOSE := docker compose
 COMPOSE_APP := docker compose --profile app
 COMPOSE_FULL := docker compose --profile full
+COMPOSE_ALL := docker compose --profile app --profile full
 
 .PHONY: help up up-core up-app up-full down logs psql topics reset seed
 
@@ -23,16 +24,16 @@ up-full: up-app ## Start everything (core + app + backend + dashboard)
 	$(COMPOSE_FULL) up -d --build
 
 down: ## Stop and remove all containers/services (keeps volumes)
-	$(COMPOSE_FULL) down
+	$(COMPOSE_ALL) down
 
 reset: ## Stop everything and wipe volumes (fresh start)
-	$(COMPOSE_APP) down -v
+	$(COMPOSE_ALL) down -v
 
 logs: ## Tail logs of all services
-	$(COMPOSE_FULL) logs -f
+	$(COMPOSE_ALL) logs -f
 
 ps: ## Show running services and health
-	$(COMPOSE_FULL) ps
+	$(COMPOSE_ALL) ps
 
 psql: ## Open a psql shell into frauddb
 	docker exec -it fraud-postgres psql -U ${POSTGRES_USER:-fraud} -d ${POSTGRES_DB:-frauddb}
